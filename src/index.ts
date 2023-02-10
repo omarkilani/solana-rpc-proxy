@@ -1,6 +1,7 @@
 export interface Env {
   SOLANA_TX: KVNamespace;
   SOLANA_RPC_ENDPOINT: string;
+  RPC_TOKEN: string;
 }
 
 type IncomingRequest = {
@@ -148,6 +149,13 @@ export default {
   ): Promise<Response> {
     if (request.method !== "POST") {
       return MethodNotAllowed(request);
+    }
+
+    const url = new URL(request.url);
+    if (url.pathname !== "/" + env.RPC_TOKEN + "/") {
+      return new Response(`Access Denied`, {
+        status: 403,
+      });
     }
 
     const jsonToForward = await readRequestBody(request);
