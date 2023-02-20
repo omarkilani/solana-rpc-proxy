@@ -488,6 +488,7 @@ dependencies = [
  "envy",
  "http-body-util",
  "hyper",
+ "log",
  "pretty_env_logger",
  "serde",
  "serde_json",

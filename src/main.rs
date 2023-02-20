@@ -5,9 +5,11 @@ use hyper::service::service_fn;
 use hyper::{
     body::Incoming as IncomingBody, header, HeaderMap, Method, Request, Response, StatusCode,
 };
+use log::{debug, error, info};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -15,43 +17,6 @@ use tokio::net::{TcpListener, TcpStream};
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
-
-fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
-    Full::new(chunk.into())
-        .map_err(|never| match never {})
-        .boxed()
-}
-
-async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
-    match (
-        req.method(),
-        req.uri().path(),
-        req.headers()
-            .get(header::CONTENT_TYPE)
-            .map(|v| v.to_str().ok())
-            .flatten(),
-    ) {
-        (&Method::POST, path, Some("application/json"))
-            if path == format!("/{}/", config.rpc_token) =>
-        {
-            handle(config, req).await
-        }
-        (&Method::POST, _, Some("application/json")) => Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(full("Access Denied"))
-            .unwrap()),
-
-        (&Method::POST, _, _) => Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(full("Bad Request"))
-            .unwrap()),
-
-        (method, _, _) => Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(full(format!("Method {} not allowed.", method)))
-            .unwrap()),
-    }
-}
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -72,7 +37,7 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(&addr).await?;
 
-    println!("Listening on http://{}", addr);
+    info!("Listening on http://{}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -86,52 +51,189 @@ async fn main() -> Result<()> {
                 .serve_connection(stream, service)
                 .await
             {
-                println!("Failed to serve connection: {:?}", err);
+                error!("Failed to serve connection: {err}");
             }
         });
     }
 }
 
-fn get_txns_from_cache(txn_ids: Vec<&str>) -> HashMap<&str, Value> {
-    todo!();
+fn create_body<A: Into<Bytes>>(chunk: A) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
 }
 
-fn add_to_cache(requests: &Vec<(usize, &Value)>, responses: &HashMap<usize, Value>) {
-    todo!();
+async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
+    match (
+        req.method(),
+        req.uri().path(),
+        req.headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().ok())
+            .flatten(),
+    ) {
+        (&Method::POST, path, Some("application/json"))
+            if path == format!("/{}/", config.rpc_token) =>
+        {
+            let request_headers = req.headers().clone();
+
+            let request_body = req.collect().await?.aggregate();
+
+            let request_json: Value = serde_json::from_reader(request_body.reader())?;
+
+            debug!("JSON-RPC Request: {}", request_json);
+
+            let response_json: Value =
+                handle_jsonrpc(config, request_headers, request_json).await?;
+
+            let response_body = serde_json::to_string(&response_json)?;
+
+            debug!("JSON-RPC Response: {response_body}");
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(create_body(response_body))
+                .map_err(|e| e.into())
+        }
+        (&Method::POST, _, Some("application/json")) => Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(create_body("Access Denied"))
+            .unwrap()),
+
+        (&Method::POST, _, _) => Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(create_body("Bad Request"))
+            .unwrap()),
+
+        (method, _, _) => Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(create_body(format!("Method {} not allowed.", method)))
+            .unwrap()),
+    }
 }
 
-fn get_from_upstream(
-    config: Arc<Config>,
-    headers: HeaderMap,
-    requests: &Vec<(usize, &Value)>,
-) -> HashMap<usize, Value> {
-    //let upstream_responses_by_idx: HashMap<usize, &Value> = outstanding
+fn get_from_cache(_requests: Vec<&Value>) -> HashMap<String, Value> {
+    // TODO
+    //cacheable_requests
     //    .iter()
-    //    .zip(upstream_responses.iter())
-    //    .map(|((i, _), response)| (*i, response))
-    //    .collect();
-    todo!();
+    //    .map(|(i, request)| get_cache_key(request).unwrap_or(""))
+    //    .filter(|cache_key| cache_key != &"")
+    //    .collect(),
+    HashMap::new()
 }
 
-fn is_txn_request(request: &Value) -> bool {
-    request["method"] == "getTransaction"
+fn add_to_cache(_requests: &Vec<(usize, &Value)>, _responses: &HashMap<usize, Value>) {
+    // TODO
 }
 
-fn get_txn_id(request: &Value) -> Option<&str> {
-    request["params"][0].as_str()
+async fn http_post_json(url: &str, payload: &Value, headers: &HeaderMap) -> Result<Value> {
+    use hyper::client::conn::http1::handshake;
+
+    let body = serde_json::to_string(payload)?;
+
+    debug!("Send upstream request: {url}, {headers:#?}, {body}");
+
+    let request = headers
+        .into_iter()
+        .fold(Request::builder(), |builder, (k, v)| builder.header(k, v))
+        .method(Method::POST)
+        .uri(url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(create_body(body))?;
+
+    let host = request.uri().host().expect("url has no host");
+
+    let port = request.uri().port_u16().unwrap_or(80);
+
+    let stream: TcpStream = TcpStream::connect(format!("{host}:{port}")).await?;
+
+    let (mut sender, connection) = handshake::<TcpStream, BoxBody>(stream).await?;
+
+    tokio::task::spawn(async move {
+        if let Err(err) = connection.await {
+            error!("Connection error: {err}");
+        }
+    });
+
+    let response = sender.send_request(request).await?;
+
+    let mut response_body = String::new();
+
+    response
+        .collect()
+        .await?
+        .aggregate()
+        .reader()
+        .read_to_string(&mut response_body)?;
+
+    debug!("Received upstream response: {response_body}");
+
+    serde_json::from_str(&response_body).map_err(|e| e.into())
 }
 
-async fn handle(
+async fn get_from_upstream(
     config: Arc<Config>,
-    http_request: Request<IncomingBody>,
-) -> Result<Response<BoxBody>> {
-    let headers = http_request.headers().clone();
+    headers: &HeaderMap,
+    requests: &Vec<(usize, &Value)>,
+) -> Result<HashMap<usize, Value>> {
+    debug!("Upstream request batch size: {}", requests.len());
 
-    let http_request_body = http_request.collect().await?.aggregate();
+    let payload: Value = serde_json::to_value(
+        &requests
+            .iter()
+            .map(|(_, request)| *request)
+            .collect::<Vec<&Value>>(),
+    )?;
 
-    let http_request_json: Value = serde_json::from_reader(http_request_body.reader())?;
+    let json: Value =
+        http_post_json(config.solana_rpc_endpoint.as_str(), &payload, headers).await?;
 
-    let (requests, is_batch): (Vec<Value>, bool) = match http_request_json {
+    debug!("Received upstream response: {json}");
+
+    let responses: Vec<Value> = match json {
+        Value::Array(arr) => Ok(arr),
+        unexpected => Err(format!("Unexpected upstream response: {unexpected}")),
+    }?;
+
+    if requests.len() == responses.len() {
+        Ok(HashMap::from_iter(
+            requests
+                .into_iter()
+                .zip(responses.into_iter())
+                .map(|((i, _), response)| (*i, response)),
+        ))
+    } else {
+        Err(format!(
+            "Can't match requests with responses: {} vs {}",
+            requests.len(),
+            responses.len()
+        )
+        .into())
+    }
+}
+
+fn is_cacheable_request(request: &Value) -> bool {
+    get_cache_key(request).is_some()
+}
+
+fn get_cache_key(request: &Value) -> Option<String> {
+    request["method"].as_str().and_then(|method| match method {
+        "getTransaction" => {
+            let txn_id = request["params"][0].as_str()?;
+
+            let max_supported_txn_version = request["params"][1]["maxSupportedTransactionVersion"]
+                .as_u64()
+                .unwrap_or(0);
+
+            Some(format!("{method}::{txn_id}::{max_supported_txn_version}"))
+        }
+        _ => None,
+    })
+}
+
+async fn handle_jsonrpc(config: Arc<Config>, headers: HeaderMap, json: Value) -> Result<Value> {
+    let (requests, is_batch): (Vec<Value>, bool) = match json {
         Value::Array(array) => (array, true),
         value => (vec![value], false),
     };
@@ -140,25 +242,25 @@ async fn handle(
         requests
             .iter()
             .enumerate()
-            .partition(|(i, request)| is_txn_request(request));
+            .partition(|(_, request)| is_cacheable_request(request));
 
-    let cached_txns: HashMap<&str, Value> = get_txns_from_cache(
+    let cached_responses: HashMap<String, Value> = get_from_cache(
         cacheable_requests
             .iter()
-            .map(|(i, request)| get_txn_id(request).unwrap_or(""))
-            .filter(|txn_id| txn_id != &"")
+            .map(|(_, request)| *request)
             .collect(),
     );
 
     let outstanding_requests: Vec<(usize, &Value)> = cacheable_requests
-        .iter()
-        .filter(|(i, request)| !cached_txns.contains_key(get_txn_id(request).unwrap_or("")))
-        .chain(non_cacheable_requests.iter())
-        .copied()
+        .into_iter()
+        .filter(|(_, request)| {
+            !cached_responses.contains_key(&get_cache_key(request).unwrap_or(String::new()))
+        })
+        .chain(non_cacheable_requests.into_iter())
         .collect();
 
     let upstream_responses: HashMap<usize, Value> =
-        get_from_upstream(config, headers, &outstanding_requests);
+        get_from_upstream(config, &headers, &outstanding_requests).await?;
 
     add_to_cache(&outstanding_requests, &upstream_responses);
 
@@ -166,8 +268,8 @@ async fn handle(
         .iter()
         .enumerate()
         .map(|(i, request)| {
-            let response: Option<&Value> = if is_txn_request(request) {
-                cached_txns.get(get_txn_id(request).unwrap_or(""))
+            let response: Option<&Value> = if is_cacheable_request(request) {
+                cached_responses.get(&get_cache_key(request).unwrap_or(String::new()))
             } else {
                 None
             };
@@ -178,22 +280,13 @@ async fn handle(
         })
         .collect();
 
-    let http_response_body = serde_json::to_string(
-        &(if is_batch {
-            Value::Array(all_responses.into_iter().cloned().collect())
-        } else {
-            all_responses
-                .into_iter()
-                .cloned()
-                .next()
-                .unwrap_or(Value::Null)
-        }),
-    )?;
-
-    let http_response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(full(http_response_body))?;
-
-    Ok(http_response)
+    Ok(if is_batch {
+        Value::Array(all_responses.into_iter().cloned().collect())
+    } else {
+        all_responses
+            .into_iter()
+            .cloned()
+            .next()
+            .unwrap_or(Value::Null)
+    })
 }
