@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes};
+use dotenvy::dotenv;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -6,13 +7,16 @@ use hyper::{
     body::Incoming as IncomingBody, header, HeaderMap, Method, Request, Response, StatusCode,
 };
 use log::{debug, error, info};
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::postgres::{PgPoolOptions, PgQueryResult};
+use sqlx::{PgPool, QueryBuilder};
 use std::collections::HashMap;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use std::time::Duration;
+use tokio::net::TcpListener;
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
@@ -20,32 +24,56 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 #[derive(Deserialize, Debug)]
 struct Config {
+    database_url: String,
+    listen_address: SocketAddr,
     rpc_token: String,
     solana_rpc_endpoint: String,
 }
 
+struct Env {
+    config: Config,
+    db_pool: PgPool,
+    http_client: Client,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv().unwrap_or_default();
+
     pretty_env_logger::init();
 
-    let config = Arc::new(
-        envy::from_env::<Config>()
-            .expect("Please provide RPC_TOKEN and SOLANA_RPC_ENDPOINT env var"),
+    let config = envy::from_env::<Config>().expect(
+        "Please provide DATABASE_URL, LISTEN_ADDRESS, RPC_TOKEN, and SOLANA_RPC_ENDPOINT env vars",
     );
 
-    let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+    let db_pool: PgPool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.database_url)
+        .await?;
 
-    let listener = TcpListener::bind(&addr).await?;
+    info!("Created a db pool: {:?}", &db_pool);
 
-    info!("Listening on http://{}", addr);
+    let http_client = Client::new();
+
+    info!("Created an http client: {:?}", &http_client);
+
+    let env = Arc::new(Env {
+        config,
+        db_pool,
+        http_client,
+    });
+
+    let listener = TcpListener::bind(&env.config.listen_address).await?;
+
+    info!("Listening on http://{}", &env.config.listen_address);
 
     loop {
         let (stream, _) = listener.accept().await?;
 
-        let config = Arc::clone(&config);
+        let env = Arc::clone(&env);
 
         tokio::task::spawn(async move {
-            let service = service_fn(|req| route(Arc::clone(&config), req));
+            let service = service_fn(|req| handle_request(Arc::clone(&env), req));
 
             if let Err(err) = http1::Builder::new()
                 .serve_connection(stream, service)
@@ -63,7 +91,18 @@ fn create_body<A: Into<Bytes>>(chunk: A) -> BoxBody {
         .boxed()
 }
 
-async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
+async fn handle_request(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
+    route(env, req).await.or_else(|err: GenericError| {
+        debug!("Unexpected error: {err}");
+
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(create_body("Internal Server Error"))
+            .map_err(|err| err.into())
+    })
+}
+
+async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
     match (
         req.method(),
         req.uri().path(),
@@ -73,7 +112,7 @@ async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Respon
             .flatten(),
     ) {
         (&Method::POST, path, Some("application/json"))
-            if path == format!("/{}/", config.rpc_token) =>
+            if path == format!("/{}/", env.config.rpc_token) =>
         {
             let request_headers = req.headers().clone();
 
@@ -83,8 +122,7 @@ async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Respon
 
             debug!("JSON-RPC Request: {}", request_json);
 
-            let response_json: Value =
-                handle_jsonrpc(config, request_headers, request_json).await?;
+            let response_json: Value = handle_jsonrpc(env, request_headers, request_json).await?;
 
             let response_body = serde_json::to_string(&response_json)?;
 
@@ -94,105 +132,123 @@ async fn route(config: Arc<Config>, req: Request<IncomingBody>) -> Result<Respon
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(create_body(response_body))
-                .map_err(|e| e.into())
         }
-        (&Method::POST, _, Some("application/json")) => Ok(Response::builder()
+        (&Method::POST, _, Some("application/json")) => Response::builder()
             .status(StatusCode::FORBIDDEN)
-            .body(create_body("Access Denied"))
-            .unwrap()),
+            .body(create_body("Access Denied")),
 
-        (&Method::POST, _, _) => Ok(Response::builder()
+        (&Method::POST, _, _) => Response::builder()
             .status(StatusCode::BAD_REQUEST)
-            .body(create_body("Bad Request"))
-            .unwrap()),
+            .body(create_body("Bad Request")),
 
-        (method, _, _) => Ok(Response::builder()
+        (method, _, _) => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(create_body(format!("Method {} not allowed.", method)))
-            .unwrap()),
+            .body(create_body(format!("Method {method} not allowed."))),
     }
+    .map_err(|err| err.into())
 }
 
-fn get_from_cache(_requests: Vec<&Value>) -> HashMap<String, Value> {
-    // TODO
-    //cacheable_requests
-    //    .iter()
-    //    .map(|(i, request)| get_cache_key(request).unwrap_or(""))
-    //    .filter(|cache_key| cache_key != &"")
-    //    .collect(),
-    HashMap::new()
+#[derive(sqlx::FromRow)]
+struct CachedResponse {
+    key: String,
+    response: String,
 }
 
-fn add_to_cache(_requests: &Vec<(usize, &Value)>, _responses: &HashMap<usize, Value>) {
-    // TODO
+async fn get_from_cache(env: Arc<Env>, requests: Vec<&Value>) -> HashMap<String, Value> {
+    let keys: Vec<String> = requests.into_iter().filter_map(get_cache_key).collect();
+
+    sqlx::query_as::<_, CachedResponse>("SELECT * FROM cached_response WHERE key = ANY($1)")
+        .bind(keys)
+        .fetch_all(&env.db_pool)
+        .await
+        .map_or(HashMap::new(), |cached_responses| {
+            cached_responses
+                .into_iter()
+                .filter_map(|CachedResponse { key, response }| {
+                    serde_json::from_str(&response)
+                        .ok()
+                        .map(|value| (key, value))
+                })
+                .collect()
+        })
 }
 
-async fn http_post_json(url: &str, payload: &Value, headers: &HeaderMap) -> Result<Value> {
-    use hyper::client::conn::http1::handshake;
+async fn add_to_cache(
+    env: Arc<Env>,
+    requests: &Vec<(usize, &Value)>,
+    responses: &HashMap<usize, Value>,
+) -> Result<PgQueryResult> {
+    let responses_by_key = requests
+        .into_iter()
+        .filter_map(|(i, request)| get_cache_key(request).map(|key| (i, key)))
+        .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)));
+
+    QueryBuilder::new("INSERT INTO cached_response(key, response) ")
+        .push_values(responses_by_key, |mut builder, (key, response)| {
+            builder.push_bind(key).push_bind(response);
+        })
+        .build()
+        .execute(&env.db_pool)
+        .await
+        .map_err(|err| err.into())
+}
+
+async fn http_post_json(
+    env: Arc<Env>,
+    url: &str,
+    payload: &Value,
+    headers: HeaderMap,
+) -> Result<Value> {
+    debug!("HTTP request body: {payload}");
 
     let body = serde_json::to_string(payload)?;
 
-    debug!("Send upstream request: {url}, {headers:#?}, {body}");
+    let excluded_headers = ["host", "content-length"];
 
-    let request = headers
-        .into_iter()
-        .fold(Request::builder(), |builder, (k, v)| builder.header(k, v))
-        .method(Method::POST)
-        .uri(url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(create_body(body))?;
+    let request_builder = headers
+        .iter()
+        .filter(|(k, _)| !excluded_headers.contains(&k.as_str().to_lowercase().as_str()))
+        .fold(env.http_client.post(url), |builder, (k, v)| {
+            builder.header(k, v)
+        })
+        .timeout(Duration::from_secs(30))
+        .body(body);
 
-    let host = request.uri().host().expect("url has no host");
+    debug!("HTTP request: {request_builder:?}");
 
-    let port = request.uri().port_u16().unwrap_or(80);
+    let response = request_builder.send().await?;
 
-    let stream: TcpStream = TcpStream::connect(format!("{host}:{port}")).await?;
+    debug!("HTTP response: {response:?}");
 
-    let (mut sender, connection) = handshake::<TcpStream, BoxBody>(stream).await?;
+    let text = response.text().await?;
 
-    tokio::task::spawn(async move {
-        if let Err(err) = connection.await {
-            error!("Connection error: {err}");
-        }
-    });
+    debug!("HTTP response body: {text}");
 
-    let response = sender.send_request(request).await?;
-
-    let mut response_body = String::new();
-
-    response
-        .collect()
-        .await?
-        .aggregate()
-        .reader()
-        .read_to_string(&mut response_body)?;
-
-    debug!("Received upstream response: {response_body}");
-
-    serde_json::from_str(&response_body).map_err(|e| e.into())
+    serde_json::from_str(&text).map_err(|e| e.into())
 }
 
 async fn get_from_upstream(
-    config: Arc<Config>,
-    headers: &HeaderMap,
+    env: Arc<Env>,
+    headers: HeaderMap,
     requests: &Vec<(usize, &Value)>,
 ) -> Result<HashMap<usize, Value>> {
-    debug!("Upstream request batch size: {}", requests.len());
+    let is_batch = requests.len() > 1;
 
-    let payload: Value = serde_json::to_value(
-        &requests
-            .iter()
-            .map(|(_, request)| *request)
-            .collect::<Vec<&Value>>(),
+    let payload: Value = serde_json::to_value::<Vec<&Value>>(
+        requests.into_iter().map(|(_, request)| *request).collect(),
     )?;
 
-    let json: Value =
-        http_post_json(config.solana_rpc_endpoint.as_str(), &payload, headers).await?;
-
-    debug!("Received upstream response: {json}");
+    let json: Value = http_post_json(
+        Arc::clone(&env),
+        env.config.solana_rpc_endpoint.as_str(),
+        if is_batch { &payload } else { &payload[0] },
+        headers,
+    )
+    .await?;
 
     let responses: Vec<Value> = match json {
-        Value::Array(arr) => Ok(arr),
+        Value::Array(arr) if is_batch => Ok(arr),
+        value if !is_batch => Ok(vec![value]),
         unexpected => Err(format!("Unexpected upstream response: {unexpected}")),
     }?;
 
@@ -232,7 +288,7 @@ fn get_cache_key(request: &Value) -> Option<String> {
     })
 }
 
-async fn handle_jsonrpc(config: Arc<Config>, headers: HeaderMap, json: Value) -> Result<Value> {
+async fn handle_jsonrpc(env: Arc<Env>, headers: HeaderMap, json: Value) -> Result<Value> {
     let (requests, is_batch): (Vec<Value>, bool) = match json {
         Value::Array(array) => (array, true),
         value => (vec![value], false),
@@ -245,11 +301,13 @@ async fn handle_jsonrpc(config: Arc<Config>, headers: HeaderMap, json: Value) ->
             .partition(|(_, request)| is_cacheable_request(request));
 
     let cached_responses: HashMap<String, Value> = get_from_cache(
+        Arc::clone(&env),
         cacheable_requests
             .iter()
             .map(|(_, request)| *request)
             .collect(),
-    );
+    )
+    .await;
 
     let outstanding_requests: Vec<(usize, &Value)> = cacheable_requests
         .into_iter()
@@ -259,10 +317,15 @@ async fn handle_jsonrpc(config: Arc<Config>, headers: HeaderMap, json: Value) ->
         .chain(non_cacheable_requests.into_iter())
         .collect();
 
-    let upstream_responses: HashMap<usize, Value> =
-        get_from_upstream(config, &headers, &outstanding_requests).await?;
+    let upstream_responses: HashMap<usize, Value> = if outstanding_requests.is_empty() {
+        HashMap::new()
+    } else {
+        get_from_upstream(Arc::clone(&env), headers, &outstanding_requests).await?
+    };
 
-    add_to_cache(&outstanding_requests, &upstream_responses);
+    if !upstream_responses.is_empty() {
+        add_to_cache(Arc::clone(&env), &outstanding_requests, &upstream_responses).await?;
+    }
 
     let all_responses: Vec<&Value> = requests
         .iter()
@@ -279,6 +342,13 @@ async fn handle_jsonrpc(config: Arc<Config>, headers: HeaderMap, json: Value) ->
                 .unwrap_or(&Value::Null)
         })
         .collect();
+
+    info!(
+        "JSON-RPC Response batch size: {} (from_cache={}, from_upstream={})",
+        all_responses.len(),
+        cached_responses.len(),
+        upstream_responses.len()
+    );
 
     Ok(if is_batch {
         Value::Array(all_responses.into_iter().cloned().collect())
