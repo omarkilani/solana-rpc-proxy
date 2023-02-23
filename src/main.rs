@@ -279,8 +279,8 @@ fn get_cache_key(request: &Value) -> Option<String> {
             let txn_id = request["params"][0].as_str()?;
 
             let max_supported_txn_version = request["params"][1]["maxSupportedTransactionVersion"]
-                .as_u64()
-                .unwrap_or(0);
+                .as_i64()
+                .unwrap_or(-1);
 
             Some(format!("{method}::{txn_id}::{max_supported_txn_version}"))
         }
