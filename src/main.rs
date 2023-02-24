@@ -46,14 +46,17 @@ enum RpcRequest {
 
 impl RpcRequest {
     fn new(calls: Vec<RpcCall>) -> Option<RpcRequest> {
-        match calls.as_slice() {
-            [] => None,
-            [call] => Some(RpcRequest::Single(call)),
-            _ => Some(RpcRequest::Batch(calls)),
+        if calls.len() > 1 {
+            Some(RpcRequest::Batch(calls))
+        } else {
+            calls
+                .into_iter()
+                .next()
+                .map(|call| RpcRequest::Single(call))
         }
     }
 
-    fn calls(&self) -> Vec<&RpcCall> {
+    fn calls(self) -> Vec<RpcCall> {
         match self {
             RpcRequest::Batch(calls) => calls.into_iter().collect(),
             RpcRequest::Single(call) => vec![call],
@@ -80,10 +83,8 @@ impl RpcResponse {
             id: None,
         })
     }
-}
 
-impl RpcResponse {
-    fn results(&self) -> Vec<&RpcResult> {
+    fn results(self) -> Vec<RpcResult> {
         match self {
             RpcResponse::Batch(results) => results.into_iter().collect(),
             RpcResponse::Single(result) => vec![result],
@@ -107,7 +108,7 @@ struct RpcResult {
     result: Option<Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 enum Id {
     Null,
@@ -249,7 +250,7 @@ struct CachedRpcResult {
     response: String,
 }
 
-async fn get_from_cache(env: Arc<Env>, calls: &Vec<&RpcCall>) -> HashMap<CacheKey, RpcResult> {
+async fn get_from_cache(env: Arc<Env>, calls: &Vec<RpcCall>) -> HashMap<CacheKey, RpcResult> {
     let keys: Vec<String> = calls
         .into_iter()
         .filter_map(|call| get_cache_key(call))
@@ -274,28 +275,35 @@ async fn get_from_cache(env: Arc<Env>, calls: &Vec<&RpcCall>) -> HashMap<CacheKe
 
 async fn add_to_cache(
     env: Arc<Env>,
-    requests: &Vec<(usize, &Value)>,
-    responses: &HashMap<usize, Value>,
+    calls: &Vec<RpcCall>,
+    results: &Vec<RpcResult>,
 ) -> Result<PgQueryResult> {
-    todo!();
-    //let responses_by_key: Vec<(String, &Value)> = requests
-    //    .into_iter()
-    //    .filter_map(|(i, request)| get_cache_key(request).map(|key| (i, key)))
-    //    .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)))
-    //    .collect();
+    let cacheable_results: Vec<(CacheKey, Value)> = calls
+        .into_iter()
+        .filter_map(|call| {
+            let cache_key = get_cache_key(call)?;
+            let result = results.into_iter().find(|result| result.id == call.id)?;
+            let json_value = serde_json::to_value(result).ok()?;
 
-    //if responses_by_key.is_empty() {
-    //    Ok(PgQueryResult::default())
-    //} else {
-    //    QueryBuilder::new("INSERT INTO cached_response(key, response) ")
-    //        .push_values(responses_by_key, |mut builder, (key, response)| {
-    //            builder.push_bind(key).push_bind(response);
-    //        })
-    //        .build()
-    //        .execute(&env.db_pool)
-    //        .await
-    //        .map_err(|err| err.into())
-    //}
+            Some((cache_key, json_value))
+        })
+        .collect();
+
+    if cacheable_results.is_empty() {
+        Ok(PgQueryResult::default())
+    } else {
+        QueryBuilder::new("INSERT INTO cached_response(key, response) ")
+            .push_values(
+                cacheable_results,
+                |mut builder, (CacheKey(key), json_value)| {
+                    builder.push_bind(key).push_bind(json_value);
+                },
+            )
+            .build()
+            .execute(&env.db_pool)
+            .await
+            .map_err(|err| err.into())
+    }
 }
 
 async fn http_post_json(
@@ -381,15 +389,15 @@ async fn handle_jsonrpc(
     headers: HeaderMap,
     request: RpcRequest,
 ) -> Result<RpcResponse> {
-    let (cacheable_calls, non_cacheable_calls): (Vec<&RpcCall>, Vec<&RpcCall>) = request
+    let (cacheable_calls, non_cacheable_calls): (Vec<RpcCall>, Vec<RpcCall>) = request
         .calls()
-        .iter()
+        .into_iter()
         .partition(|call| is_cacheable_call(call));
 
     let cached_results: HashMap<CacheKey, RpcResult> =
         get_from_cache(Arc::clone(&env), &cacheable_calls).await;
 
-    let outstanding_calls: Vec<&RpcCall> = cacheable_calls
+    let outstanding_calls: Vec<RpcCall> = cacheable_calls
         .into_iter()
         .filter(|call| {
             get_cache_key(call)
@@ -399,11 +407,16 @@ async fn handle_jsonrpc(
         .chain(non_cacheable_calls.into_iter())
         .collect();
 
-    //let upstream_results: Vec<RpcResults> = if outstanding_calls.is_empty() {
-    //    vec![]
-    //} else {
-    //    get_from_upstream(Arc::clone(&env), headers, &outstanding_calls).await?
-    //};
+    let upstream_request = RpcRequest::new(outstanding_calls);
+
+    let upstream_results: Vec<RpcResult> = match upstream_request {
+        Some(upstream_request) => get_from_upstream(Arc::clone(&env), headers, &upstream_request)
+            .await
+            .map(|upstream_response| upstream_response.results())?,
+        _ => vec![],
+    };
+
+    add_to_cache(Arc::clone(&env), upstream_request.calls(), &upstream_results).await?;
 
     todo!();
 }
