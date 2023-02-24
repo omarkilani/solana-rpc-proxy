@@ -8,7 +8,7 @@ use hyper::{
 };
 use log::{debug, error, info};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{PgPool, QueryBuilder};
@@ -22,6 +22,8 @@ type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
+const RPC_VERSION: &str = "2.0";
+
 #[derive(Deserialize, Debug)]
 struct Config {
     database_url: String,
@@ -34,6 +36,90 @@ struct Env {
     config: Config,
     db_pool: PgPool,
     http_client: Client,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum RpcRequest {
+    Batch(Vec<RpcCall>),
+    Single(RpcCall),
+}
+
+impl RpcRequest {
+    fn new(calls: Vec<RpcCall>) -> Option<RpcRequest> {
+        match calls.as_slice() {
+            [] => None,
+            [call] => Some(RpcRequest::Single(call)),
+            _ => Some(RpcRequest::Batch(calls)),
+        }
+    }
+
+    fn calls(&self) -> Vec<&RpcCall> {
+        match self {
+            RpcRequest::Batch(calls) => calls.into_iter().collect(),
+            RpcRequest::Single(call) => vec![call],
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum RpcResponse {
+    Batch(Vec<RpcResult>),
+    Single(RpcResult),
+}
+
+impl RpcResponse {
+    fn error(code: i64, message: &str, data: Option<Value>) -> RpcResponse {
+        RpcResponse::Single(RpcResult {
+            jsonrpc: RPC_VERSION.to_string(),
+            result: None,
+            error: Some(RpcError {
+                code,
+                data,
+                message: message.to_string(),
+            }),
+            id: None,
+        })
+    }
+}
+
+impl RpcResponse {
+    fn results(&self) -> Vec<&RpcResult> {
+        match self {
+            RpcResponse::Batch(results) => results.into_iter().collect(),
+            RpcResponse::Single(result) => vec![result],
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RpcCall {
+    id: Option<Id>,
+    jsonrpc: String,
+    method: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RpcResult {
+    error: Option<RpcError>,
+    id: Option<Id>,
+    jsonrpc: String,
+    result: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Id {
+    Null,
+    Number(u64),
+    String(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RpcError {
+    code: i64,
+    data: Option<Value>,
+    message: String,
 }
 
 #[tokio::main]
@@ -118,13 +204,22 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
 
             let request_body = req.collect().await?.aggregate();
 
-            let request_json: Value = serde_json::from_reader(request_body.reader())?;
+            let rpc_response =
+                match serde_json::from_reader::<_, RpcRequest>(request_body.reader()) {
+                    Ok(rpc_request) => {
+                        debug!("JSON-RPC Request: {rpc_request:?}");
 
-            debug!("JSON-RPC Request: {}", request_json);
+                        handle_jsonrpc(env, request_headers, rpc_request).await
+                    }
+                    Err(err) => {
+                        debug!("JSON-RPC Invalid request: {err:?}");
 
-            let response_json: Value = handle_jsonrpc(env, request_headers, request_json).await?;
+                        Ok(RpcResponse::error(-32600, "Invalid Request", None))
+                    }
+                }
+                .unwrap_or(RpcResponse::error(-32603, "Internal error", None));
 
-            let response_body = serde_json::to_string(&response_json)?;
+            let response_body = serde_json::to_string(&rpc_response)?;
 
             debug!("JSON-RPC Response: {response_body}");
 
@@ -149,25 +244,29 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
 }
 
 #[derive(sqlx::FromRow)]
-struct CachedResponse {
+struct CachedRpcResult {
     key: String,
     response: String,
 }
 
-async fn get_from_cache(env: Arc<Env>, requests: Vec<&Value>) -> HashMap<String, Value> {
-    let keys: Vec<String> = requests.into_iter().filter_map(get_cache_key).collect();
+async fn get_from_cache(env: Arc<Env>, calls: &Vec<&RpcCall>) -> HashMap<CacheKey, RpcResult> {
+    let keys: Vec<String> = calls
+        .into_iter()
+        .filter_map(|call| get_cache_key(call))
+        .map(|CacheKey(string_value)| string_value)
+        .collect();
 
-    sqlx::query_as::<_, CachedResponse>("SELECT * FROM cached_response WHERE key = ANY($1)")
+    sqlx::query_as::<_, CachedRpcResult>("SELECT * FROM cached_response WHERE key = ANY($1)")
         .bind(keys)
         .fetch_all(&env.db_pool)
         .await
         .map_or(HashMap::new(), |cached_responses| {
             cached_responses
                 .into_iter()
-                .filter_map(|CachedResponse { key, response }| {
+                .filter_map(|CachedRpcResult { key, response }| {
                     serde_json::from_str(&response)
                         .ok()
-                        .map(|value| (key, value))
+                        .map(|rpc_result| (CacheKey(key), rpc_result))
                 })
                 .collect()
         })
@@ -178,24 +277,25 @@ async fn add_to_cache(
     requests: &Vec<(usize, &Value)>,
     responses: &HashMap<usize, Value>,
 ) -> Result<PgQueryResult> {
-    let responses_by_key: Vec<(String, &Value)> = requests
-        .into_iter()
-        .filter_map(|(i, request)| get_cache_key(request).map(|key| (i, key)))
-        .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)))
-        .collect();
+    todo!();
+    //let responses_by_key: Vec<(String, &Value)> = requests
+    //    .into_iter()
+    //    .filter_map(|(i, request)| get_cache_key(request).map(|key| (i, key)))
+    //    .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)))
+    //    .collect();
 
-    if responses_by_key.is_empty() {
-        Ok(PgQueryResult::default())
-    } else {
-        QueryBuilder::new("INSERT INTO cached_response(key, response) ")
-            .push_values(responses_by_key, |mut builder, (key, response)| {
-                builder.push_bind(key).push_bind(response);
-            })
-            .build()
-            .execute(&env.db_pool)
-            .await
-            .map_err(|err| err.into())
-    }
+    //if responses_by_key.is_empty() {
+    //    Ok(PgQueryResult::default())
+    //} else {
+    //    QueryBuilder::new("INSERT INTO cached_response(key, response) ")
+    //        .push_values(responses_by_key, |mut builder, (key, response)| {
+    //            builder.push_bind(key).push_bind(response);
+    //        })
+    //        .build()
+    //        .execute(&env.db_pool)
+    //        .await
+    //        .map_err(|err| err.into())
+    //}
 }
 
 async fn http_post_json(
@@ -235,133 +335,152 @@ async fn http_post_json(
 async fn get_from_upstream(
     env: Arc<Env>,
     headers: HeaderMap,
-    requests: &Vec<(usize, &Value)>,
-) -> Result<HashMap<usize, Value>> {
-    let is_batch = requests.len() > 1;
-
-    let payload: Value = serde_json::to_value::<Vec<&Value>>(
-        requests.into_iter().map(|(_, request)| *request).collect(),
-    )?;
+    request: &RpcRequest,
+) -> Result<RpcResponse> {
+    let payload: Value = serde_json::to_value(request)?;
 
     let json: Value = http_post_json(
         Arc::clone(&env),
         env.config.solana_rpc_endpoint.as_str(),
-        if is_batch { &payload } else { &payload[0] },
+        &payload,
         headers,
     )
     .await?;
 
-    let responses: Vec<Value> = match json {
-        Value::Array(arr) if is_batch => Ok(arr),
-        value if !is_batch => Ok(vec![value]),
-        unexpected => Err(format!("Unexpected upstream response: {unexpected}")),
-    }?;
-
-    if requests.len() == responses.len() {
-        Ok(HashMap::from_iter(
-            requests
-                .into_iter()
-                .zip(responses.into_iter())
-                .map(|((i, _), response)| (*i, response)),
-        ))
-    } else {
-        Err(format!(
-            "Can't match requests with responses: {} vs {}",
-            requests.len(),
-            responses.len()
-        )
-        .into())
-    }
+    serde_json::from_value(json).map_err(|err| err.into())
 }
 
-fn is_cacheable_request(request: &Value) -> bool {
-    get_cache_key(request).is_some()
+fn is_cacheable_call(call: &RpcCall) -> bool {
+    get_cache_key(call).is_some()
 }
 
-fn get_cache_key(request: &Value) -> Option<String> {
-    request["method"].as_str().and_then(|method| match method {
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct CacheKey(String);
+
+fn get_cache_key(call: &RpcCall) -> Option<CacheKey> {
+    match call.method.as_str() {
         "getTransaction" => {
-            let txn_id = request["params"][0].as_str()?;
+            let txn_id = call.params.as_ref().and_then(|value| value[0].as_str())?;
 
-            let max_supported_txn_version = request["params"][1]["maxSupportedTransactionVersion"]
-                .as_i64()
+            let max_supported_txn_version = call
+                .params
+                .as_ref()
+                .and_then(|value| value[1]["maxSupportedTransactionVersion"].as_i64())
                 .unwrap_or(-1);
 
-            Some(format!("{method}::{txn_id}::{max_supported_txn_version}"))
+            Some(CacheKey(format!(
+                "getTransaction::{txn_id}::{max_supported_txn_version}"
+            )))
         }
         _ => None,
-    })
-}
-
-async fn handle_jsonrpc(env: Arc<Env>, headers: HeaderMap, json: Value) -> Result<Value> {
-    let (requests, is_batch): (Vec<Value>, bool) = match json {
-        Value::Array(array) => (array, true),
-        value => (vec![value], false),
-    };
-
-    let (cacheable_requests, non_cacheable_requests): (Vec<(usize, &Value)>, Vec<(usize, &Value)>) =
-        requests
-            .iter()
-            .enumerate()
-            .partition(|(_, request)| is_cacheable_request(request));
-
-    let cached_responses: HashMap<String, Value> = get_from_cache(
-        Arc::clone(&env),
-        cacheable_requests
-            .iter()
-            .map(|(_, request)| *request)
-            .collect(),
-    )
-    .await;
-
-    let outstanding_requests: Vec<(usize, &Value)> = cacheable_requests
-        .into_iter()
-        .filter(|(_, request)| {
-            !cached_responses.contains_key(&get_cache_key(request).unwrap_or(String::new()))
-        })
-        .chain(non_cacheable_requests.into_iter())
-        .collect();
-
-    let upstream_responses: HashMap<usize, Value> = if outstanding_requests.is_empty() {
-        HashMap::new()
-    } else {
-        get_from_upstream(Arc::clone(&env), headers, &outstanding_requests).await?
-    };
-
-    if !upstream_responses.is_empty() {
-        add_to_cache(Arc::clone(&env), &outstanding_requests, &upstream_responses).await?;
     }
+}
 
-    let all_responses: Vec<&Value> = requests
+async fn handle_jsonrpc(
+    env: Arc<Env>,
+    headers: HeaderMap,
+    request: RpcRequest,
+) -> Result<RpcResponse> {
+    let (cacheable_calls, non_cacheable_calls): (Vec<&RpcCall>, Vec<&RpcCall>) = request
+        .calls()
         .iter()
-        .enumerate()
-        .map(|(i, request)| {
-            let response: Option<&Value> = if is_cacheable_request(request) {
-                cached_responses.get(&get_cache_key(request).unwrap_or(String::new()))
-            } else {
-                None
-            };
+        .partition(|call| is_cacheable_call(call));
 
-            response
-                .or(upstream_responses.get(&i))
-                .unwrap_or(&Value::Null)
+    let cached_results: HashMap<CacheKey, RpcResult> =
+        get_from_cache(Arc::clone(&env), &cacheable_calls).await;
+
+    let outstanding_calls: Vec<&RpcCall> = cacheable_calls
+        .into_iter()
+        .filter(|call| {
+            get_cache_key(call)
+                .map(|cache_key| !cached_results.contains_key(&cache_key))
+                .unwrap_or(true)
         })
+        .chain(non_cacheable_calls.into_iter())
         .collect();
 
-    info!(
-        "JSON-RPC Response batch size: {} (from_cache={}, from_upstream={})",
-        all_responses.len(),
-        cached_responses.len(),
-        upstream_responses.len()
-    );
+    //let upstream_results: Vec<RpcResults> = if outstanding_calls.is_empty() {
+    //    vec![]
+    //} else {
+    //    get_from_upstream(Arc::clone(&env), headers, &outstanding_calls).await?
+    //};
 
-    Ok(if is_batch {
-        Value::Array(all_responses.into_iter().cloned().collect())
-    } else {
-        all_responses
-            .into_iter()
-            .cloned()
-            .next()
-            .unwrap_or(Value::Null)
-    })
+    todo!();
 }
+
+//async fn handle_jsonrpc_old(
+//    env: Arc<Env>,
+//    headers: HeaderMap,
+//    json: Value,
+//) -> Result<Value> {
+//    let (requests, is_batch): (Vec<Value>, bool) = match json {
+//        Value::Array(array) => (array, true),
+//        value => (vec![value], false),
+//    };
+//
+//    let (cacheable_requests, non_cacheable_requests): (Vec<(usize, &Value)>, Vec<(usize, &Value)>) =
+//        requests
+//            .iter()
+//            .enumerate()
+//            .partition(|(_, request)| is_cacheable_request(request));
+//
+//    let cached_responses: HashMap<String, Value> = get_from_cache(
+//        Arc::clone(&env),
+//        cacheable_requests
+//            .iter()
+//            .map(|(_, request)| *request)
+//            .collect(),
+//    )
+//    .await;
+//
+//    let outstanding_requests: Vec<(usize, &Value)> = cacheable_requests
+//        .into_iter()
+//        .filter(|(_, request)| {
+//            !cached_responses.contains_key(&get_cache_key(request).unwrap_or(String::new()))
+//        })
+//        .chain(non_cacheable_requests.into_iter())
+//        .collect();
+//
+//    let upstream_responses: HashMap<usize, Value> = if outstanding_requests.is_empty() {
+//        HashMap::new()
+//    } else {
+//        get_from_upstream(Arc::clone(&env), headers, &outstanding_requests).await?
+//    };
+//
+//    if !upstream_responses.is_empty() {
+//        add_to_cache(Arc::clone(&env), &outstanding_requests, &upstream_responses).await?;
+//    }
+//
+//    let all_responses: Vec<&Value> = requests
+//        .iter()
+//        .enumerate()
+//        .map(|(i, request)| {
+//            let response: Option<&Value> = if is_cacheable_request(request) {
+//                cached_responses.get(&get_cache_key(request).unwrap_or(String::new()))
+//            } else {
+//                None
+//            };
+//
+//            response
+//                .or(upstream_responses.get(&i))
+//                .unwrap_or(&Value::Null)
+//        })
+//        .collect();
+//
+//    info!(
+//        "JSON-RPC Response batch size: {} (from_cache={}, from_upstream={})",
+//        all_responses.len(),
+//        cached_responses.len(),
+//        upstream_responses.len()
+//    );
+//
+//    Ok(if is_batch {
+//        Value::Array(all_responses.into_iter().cloned().collect())
+//    } else {
+//        all_responses
+//            .into_iter()
+//            .cloned()
+//            .next()
+//            .unwrap_or(Value::Null)
+//    })
+//}
