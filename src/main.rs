@@ -178,19 +178,24 @@ async fn add_to_cache(
     requests: &Vec<(usize, &Value)>,
     responses: &HashMap<usize, Value>,
 ) -> Result<PgQueryResult> {
-    let responses_by_key = requests
+    let responses_by_key: Vec<(String, &Value)> = requests
         .into_iter()
         .filter_map(|(i, request)| get_cache_key(request).map(|key| (i, key)))
-        .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)));
+        .filter_map(|(i, key)| responses.get(i).map(|response| (key, response)))
+        .collect();
 
-    QueryBuilder::new("INSERT INTO cached_response(key, response) ")
-        .push_values(responses_by_key, |mut builder, (key, response)| {
-            builder.push_bind(key).push_bind(response);
-        })
-        .build()
-        .execute(&env.db_pool)
-        .await
-        .map_err(|err| err.into())
+    if responses_by_key.is_empty() {
+        Ok(PgQueryResult::default())
+    } else {
+        QueryBuilder::new("INSERT INTO cached_response(key, response) ")
+            .push_values(responses_by_key, |mut builder, (key, response)| {
+                builder.push_bind(key).push_bind(response);
+            })
+            .build()
+            .execute(&env.db_pool)
+            .await
+            .map_err(|err| err.into())
+    }
 }
 
 async fn http_post_json(

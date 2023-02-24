@@ -1,5 +1,16 @@
 [
   {
+    "method": "getAccountInfo",
+    "jsonrpc": "2.0",
+    "params": [
+      "CpAVqKkBXtQ5WZpPjDUFH9aHZjqhdSqsvpDD6Y7BiVQL",
+      {
+        "encoding": "base64"
+      }
+    ],
+    "id": "08d3b7a2-c62f-4963-9ef5-0d719e2a93fa"
+  },
+  {
     "jsonrpc": "2.0",
     "id": 1,
     "method": "getTransaction",
