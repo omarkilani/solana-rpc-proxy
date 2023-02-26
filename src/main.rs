@@ -1,5 +1,11 @@
+use brotli::enc::backward_references::BrotliEncoderMode;
+use brotli::enc::BrotliEncoderParams;
+use brotli::BrotliCompress;
 use bytes::{Buf, Bytes};
 use dotenvy::dotenv;
+use flate2::write::{DeflateEncoder, GzEncoder};
+use flate2::Compression;
+use fly_accept_encoding::Encoding;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -12,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{PgPool, QueryBuilder};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,10 +187,69 @@ async fn main() -> Result<()> {
     }
 }
 
-fn create_body<A: Into<Bytes>>(chunk: A) -> BoxBody {
-    Full::new(chunk.into())
-        .map_err(|never| match never {})
-        .boxed()
+fn create_body<A: Into<Bytes>>(chunk: A, encoding: Encoding) -> BoxBody {
+    let raw = chunk.into();
+
+    let raw_len = raw.len();
+
+    let encoded: Bytes = match encoding {
+        Encoding::Identity => Some(raw),
+        Encoding::Zstd => {
+            let input: &[u8] = &raw;
+            let mut output = Vec::with_capacity(input.len() + 64);
+
+            zstd::stream::copy_encode(input, &mut output, zstd::DEFAULT_COMPRESSION_LEVEL)
+                .map(|_| output.into())
+                .map_err(|err| error!("Cannot encode body using zstd: {err}"))
+                .ok()
+        }
+        Encoding::Brotli => {
+            let mut input: &[u8] = &raw;
+            let mut output = Vec::with_capacity(input.len() + 64);
+            let mut params = BrotliEncoderParams::default();
+            params.mode = BrotliEncoderMode::BROTLI_MODE_TEXT;
+
+            BrotliCompress(&mut input, &mut output, &params)
+                .map(|_| output.into())
+                .map_err(|err| error!("Cannot encode body using brotli: {err}"))
+                .ok()
+        }
+        Encoding::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+
+            encoder
+                .write_all(&raw)
+                .and(encoder.finish())
+                .map(|vec| vec.into())
+                .map_err(|err| error!("Cannot encode body using gzip: {err}"))
+                .ok()
+        }
+        Encoding::Deflate => {
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+
+            encoder
+                .write_all(&raw)
+                .and(encoder.finish())
+                .map(|vec| vec.into())
+                .map_err(|err| error!("Cannot encode body using deflate: {err}"))
+                .ok()
+        }
+    }
+    .unwrap_or(Bytes::new());
+
+    debug!("Body encoding: {encoding:?} ({}bytes -> {}bytes)", raw_len, encoded.len());
+
+    Full::new(encoded).map_err(|never| match never {}).boxed()
+}
+
+fn preferred_encoding(request_headers: &HeaderMap) -> Encoding {
+    fly_accept_encoding::encodings_iter(&request_headers)
+        .filter_map(|result| result.ok())
+        .filter_map(|(encoding, q)| encoding.map(|e| (e, q)))
+        .filter(|(_, q)| q != &f32::NAN)
+        .max_by(|(_, q1), (_, q2)| q1.partial_cmp(q2).unwrap_or(Ordering::Equal))
+        .map(|(encoding, _)| encoding)
+        .unwrap_or(Encoding::Identity)
 }
 
 async fn handle_request(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
@@ -191,12 +258,16 @@ async fn handle_request(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Res
 
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(create_body("Internal Server Error"))
+            .body(create_body("Internal Server Error", Encoding::Identity))
             .map_err(|err| err.into())
     })
 }
 
 async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
+    let request_headers = req.headers().clone();
+
+    let response_encoding = preferred_encoding(&request_headers);
+
     match (
         req.method(),
         req.uri().path(),
@@ -208,8 +279,6 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
         (&Method::POST, path, Some("application/json"))
             if path == format!("/{}/", env.config.rpc_token) =>
         {
-            let request_headers = req.headers().clone();
-
             let request_body = req.collect().await?.aggregate();
 
             let rpc_response = match serde_json::from_reader::<_, RpcRequest>(request_body.reader())
@@ -246,40 +315,24 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(create_body(response_body))
+                .body(create_body(response_body, response_encoding))
         }
         (&Method::POST, _, Some("application/json")) => Response::builder()
             .status(StatusCode::FORBIDDEN)
-            .body(create_body("Access Denied")),
+            .body(create_body("Access Denied", response_encoding)),
 
         (&Method::POST, _, _) => Response::builder()
             .status(StatusCode::BAD_REQUEST)
-            .body(create_body("Bad Request")),
+            .body(create_body("Bad Request", response_encoding)),
 
         (method, _, _) => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(create_body(format!("Method {method} not allowed."))),
+            .body(create_body(
+                format!("Method {method} not allowed."),
+                response_encoding,
+            )),
     }
     .map_err(|err| err.into())
-}
-
-enum BodyEncoding {
-    Identity,
-    Gzip,
-    Brotli,
-    Deflate,
-}
-
-impl BodyEncoding {
-    fn from_request_headers(headers: &HeaderMap) -> BodyEncoding {
-        let accept_encoding = headers.get(header::ACCEPT_ENCODING);
-
-        todo!();
-    }
-}
-
-fn encode_body(body: String, encoding: BodyEncoding) -> Vec<u8> {
-    todo!();
 }
 
 #[derive(sqlx::FromRow)]
