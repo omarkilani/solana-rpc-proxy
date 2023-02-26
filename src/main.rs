@@ -58,11 +58,7 @@ impl RpcRequest {
         if calls.len() > 1 {
             Some(RpcRequest::Batch(calls.into_iter().cloned().collect()))
         } else {
-            calls
-                .into_iter()
-                .cloned()
-                .next()
-                .map(|call| RpcRequest::Single(call))
+            calls.into_iter().next().cloned().map(RpcRequest::Single)
         }
     }
 
@@ -206,8 +202,10 @@ fn create_body<A: Into<Bytes>>(chunk: A, encoding: Encoding) -> BoxBody {
         Encoding::Brotli => {
             let mut input: &[u8] = &raw;
             let mut output = Vec::with_capacity(input.len() + 64);
-            let mut params = BrotliEncoderParams::default();
-            params.mode = BrotliEncoderMode::BROTLI_MODE_TEXT;
+            let params = BrotliEncoderParams {
+                mode: BrotliEncoderMode::BROTLI_MODE_TEXT,
+                ..Default::default()
+            };
 
             BrotliCompress(&mut input, &mut output, &params)
                 .map(|_| output.into())
@@ -237,13 +235,17 @@ fn create_body<A: Into<Bytes>>(chunk: A, encoding: Encoding) -> BoxBody {
     }
     .unwrap_or(Bytes::new());
 
-    debug!("Body encoding: {encoding:?} ({}bytes -> {}bytes)", raw_len, encoded.len());
+    debug!(
+        "Body encoding: {encoding:?} ({}bytes -> {}bytes)",
+        raw_len,
+        encoded.len()
+    );
 
     Full::new(encoded).map_err(|never| match never {}).boxed()
 }
 
 fn preferred_encoding(request_headers: &HeaderMap) -> Encoding {
-    fly_accept_encoding::encodings_iter(&request_headers)
+    fly_accept_encoding::encodings_iter(request_headers)
         .filter_map(|result| result.ok())
         .filter_map(|(encoding, q)| encoding.map(|e| (e, q)))
         .filter(|(_, q)| q != &f32::NAN)
@@ -273,8 +275,7 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
         req.uri().path(),
         req.headers()
             .get(header::CONTENT_TYPE)
-            .map(|v| v.to_str().ok())
-            .flatten(),
+            .and_then(|v| v.to_str().ok()),
     ) {
         (&Method::POST, path, Some("application/json"))
             if path == format!("/{}/", env.config.rpc_token) =>
@@ -315,21 +316,25 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::CONTENT_ENCODING,
+                    response_encoding.to_header_value(),
+                )
                 .body(create_body(response_body, response_encoding))
         }
         (&Method::POST, _, Some("application/json")) => Response::builder()
             .status(StatusCode::FORBIDDEN)
-            .body(create_body("Access Denied", response_encoding)),
+            .body(create_body("Access Denied", Encoding::Identity)),
 
         (&Method::POST, _, _) => Response::builder()
             .status(StatusCode::BAD_REQUEST)
-            .body(create_body("Bad Request", response_encoding)),
+            .body(create_body("Bad Request", Encoding::Identity)),
 
         (method, _, _) => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(create_body(
                 format!("Method {method} not allowed."),
-                response_encoding,
+                Encoding::Identity,
             )),
     }
     .map_err(|err| err.into())
@@ -341,9 +346,9 @@ struct CachedRpcResult {
     response: String,
 }
 
-async fn get_from_cache(env: Arc<Env>, calls: &Vec<&RpcCall>) -> HashMap<CacheKey, RpcResult> {
+async fn get_from_cache(env: Arc<Env>, calls: &[&RpcCall]) -> HashMap<CacheKey, RpcResult> {
     let call_ids: HashMap<CacheKey, Option<Id>> = calls
-        .into_iter()
+        .iter()
         .filter_map(|call| get_cache_key(call).map(|cache_key| (cache_key, call.id.clone())))
         .collect();
 
@@ -381,11 +386,11 @@ async fn get_from_cache(env: Arc<Env>, calls: &Vec<&RpcCall>) -> HashMap<CacheKe
 
 async fn add_to_cache(
     env: Arc<Env>,
-    calls: &Vec<&RpcCall>,
+    calls: &[&RpcCall],
     results: &HashMap<Option<Id>, RpcResult>,
 ) -> Result<PgQueryResult> {
     let cacheable_results: Vec<(CacheKey, Value)> = calls
-        .into_iter()
+        .iter()
         .filter_map(|call| {
             let cache_key = get_cache_key(call)?;
             let result = results.get(&call.id)?;
@@ -449,7 +454,7 @@ async fn http_post_json(
 async fn get_from_upstream(
     env: Arc<Env>,
     headers: &HeaderMap,
-    calls: &Vec<&RpcCall>,
+    calls: &[&RpcCall],
 ) -> Result<HashMap<Option<Id>, RpcResult>> {
     if let Some(rpc_request) = RpcRequest::new(calls.to_vec()) {
         let payload: Value = serde_json::to_value(rpc_request)?;
