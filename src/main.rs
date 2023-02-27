@@ -370,14 +370,19 @@ async fn get_from_cache(env: Arc<Env>, calls: &[&RpcCall]) -> HashMap<CacheKey, 
     cached_results
         .into_iter()
         .filter_map(|cached_result| {
-            let rpc_result = serde_json::from_str(&cached_result.response).ok()?;
+            let result = serde_json::from_str::<RpcResult>(&cached_result.response)
+                .ok()
+                .and_then(|rpc_result| rpc_result.result)?;
+
             let cache_key = CacheKey(cached_result.key);
 
             Some((
                 cache_key.clone(),
                 RpcResult {
+                    error: None,
                     id: call_ids.get(&cache_key).cloned().flatten(),
-                    ..rpc_result
+                    jsonrpc: RPC_VERSION.to_string(),
+                    result: Some(result),
                 },
             ))
         })
@@ -394,9 +399,14 @@ async fn add_to_cache(
         .filter_map(|call| {
             let cache_key = get_cache_key(call)?;
             let result = results.get(&call.id)?;
-            let json_value = serde_json::to_value(result).ok()?;
 
-            Some((cache_key, json_value))
+            if result.result.is_some() {
+                let json_value = serde_json::to_value(result).ok()?;
+
+                Some((cache_key, json_value))
+            } else {
+                None
+            }
         })
         .collect();
 
