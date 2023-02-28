@@ -6,6 +6,9 @@ use dotenvy::dotenv;
 use flate2::write::{DeflateEncoder, GzEncoder};
 use flate2::Compression;
 use fly_accept_encoding::Encoding;
+use futures::future;
+use futures::future::BoxFuture;
+use futures::TryFutureExt;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -37,7 +40,7 @@ struct Config {
     database_url: String,
     listen_address: SocketAddr,
     rpc_token: String,
-    solana_rpc_endpoint: String,
+    solana_rpc_endpoints: Vec<String>,
 }
 
 struct Env {
@@ -141,19 +144,21 @@ async fn main() -> Result<()> {
     pretty_env_logger::init();
 
     let config = envy::from_env::<Config>().expect(
-        "Please provide DATABASE_URL, LISTEN_ADDRESS, RPC_TOKEN, and SOLANA_RPC_ENDPOINT env vars",
+        "Please provide DATABASE_URL, LISTEN_ADDRESS, RPC_TOKEN, and SOLANA_RPC_ENDPOINTS env vars",
     );
+
+    info!("Config: {:?}", &config);
 
     let db_pool: PgPool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
         .await?;
 
-    info!("Created a db pool: {:?}", &db_pool);
+    info!("DB Pool: {:?}", &db_pool);
 
     let http_client = Client::new();
 
-    info!("Created an http client: {:?}", &http_client);
+    info!("HTTP Client: {:?}", &http_client);
 
     let env = Arc::new(Env {
         config,
@@ -433,8 +438,6 @@ async fn http_post_json(
     payload: &Value,
     headers: &HeaderMap,
 ) -> Result<Value> {
-    debug!("HTTP request body: {payload}");
-
     let body = serde_json::to_string(payload)?;
 
     let excluded_headers = ["host", "content-length"];
@@ -448,13 +451,13 @@ async fn http_post_json(
         .timeout(Duration::from_secs(30))
         .body(body);
 
-    debug!("HTTP request: {request_builder:?}");
+    debug!("HTTP request to {url}: {request_builder:?}");
 
-    let response = request_builder.send().await?;
+    let response = request_builder.send().await;
 
-    debug!("HTTP response: {response:?}");
+    debug!("HTTP response from {url}: {response:?}");
 
-    let text = response.text().await?;
+    let text = response?.text().await?;
 
     debug!("HTTP response body: {text}");
 
@@ -469,13 +472,18 @@ async fn get_from_upstream(
     if let Some(rpc_request) = RpcRequest::new(calls.to_vec()) {
         let payload: Value = serde_json::to_value(rpc_request)?;
 
-        let json: Value = http_post_json(
-            Arc::clone(&env),
-            env.config.solana_rpc_endpoint.as_str(),
-            &payload,
-            headers,
-        )
-        .await?;
+        debug!("HTTP request body: {payload}");
+
+        let task: BoxFuture<Result<Value>> = env
+            .config
+            .solana_rpc_endpoints
+            .iter()
+            .map(|endpoint| http_post_json(Arc::clone(&env), endpoint.as_str(), &payload, headers))
+            .fold(Box::pin(future::err("".into())), |acc, http_post| {
+                Box::pin(acc.or_else(|_| http_post))
+            });
+
+        let json = task.await?;
 
         let rpc_response: RpcResponse = serde_json::from_value(json)?;
 
