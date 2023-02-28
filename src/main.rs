@@ -340,6 +340,8 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
 
             let response_body = serde_json::to_string(&rpc_response)?;
 
+            debug!("JSON-RPC Response: {response_body}");
+
             http_response_builder(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(
