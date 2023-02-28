@@ -461,7 +461,7 @@ async fn http_post_json(
 ) -> Result<Value> {
     let body = serde_json::to_string(payload)?;
 
-    let excluded_headers = ["host", "content-length"];
+    let excluded_headers = ["host", "content-length", "accept-encoding"];
 
     let request_builder = headers
         .iter()
