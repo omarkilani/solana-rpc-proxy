@@ -11,6 +11,7 @@ envy = "0.4"
 flate2 = "1.0"
 fly-accept-encoding = "0.2.0"
 futures = "0.3"
+http = "0.2"
 http-body-util = "0.1.0-rc.2"
 hyper = { version = "1.0.0-rc.2", features = ["full"] }
 log = "0.4"

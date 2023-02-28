@@ -9,6 +9,7 @@ use fly_accept_encoding::Encoding;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::TryFutureExt;
+use http::response;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -176,7 +177,7 @@ async fn main() -> Result<()> {
         let env = Arc::clone(&env);
 
         tokio::task::spawn(async move {
-            let service = service_fn(|req| handle_request(Arc::clone(&env), req));
+            let service = service_fn(|req| handle_http_request(Arc::clone(&env), req));
 
             if let Err(err) = http1::Builder::new()
                 .serve_connection(stream, service)
@@ -259,15 +260,33 @@ fn preferred_encoding(request_headers: &HeaderMap) -> Encoding {
         .unwrap_or(Encoding::Identity)
 }
 
-async fn handle_request(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
-    route(env, req).await.or_else(|err: GenericError| {
+async fn handle_http_request(
+    env: Arc<Env>,
+    req: Request<IncomingBody>,
+) -> Result<Response<BoxBody>> {
+    debug!("Received HTTP request: {req:?}");
+
+    let http_response = route(env, req).await.or_else(|err: GenericError| {
         debug!("Unexpected error: {err}");
 
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
+        http_response_builder(StatusCode::INTERNAL_SERVER_ERROR)
             .body(create_body("Internal Server Error", Encoding::Identity))
             .map_err(|err| err.into())
-    })
+    });
+
+    debug!("Sent HTTP response: {http_response:?}");
+
+    http_response
+}
+
+fn http_response_builder<T>(status: T) -> response::Builder
+where
+    StatusCode: TryFrom<T>,
+    <StatusCode as TryFrom<T>>::Error: Into<http::Error>,
+{
+    Response::builder()
+        .status(status)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
 }
 
 async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<BoxBody>> {
@@ -282,6 +301,11 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
     ) {
+        (&Method::OPTIONS, _, _) => http_response_builder(StatusCode::OK)
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS")
+            .header(header::ACCESS_CONTROL_MAX_AGE, 86400)
+            .body(create_body("", Encoding::Identity)),
         (&Method::POST, path, Some("application/json"))
             if path == format!("/{}/", env.config.rpc_token) =>
         {
@@ -316,10 +340,7 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
 
             let response_body = serde_json::to_string(&rpc_response)?;
 
-            debug!("JSON-RPC Response: {response_body}");
-
-            Response::builder()
-                .status(StatusCode::OK)
+            http_response_builder(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(
                     header::CONTENT_ENCODING,
@@ -327,20 +348,18 @@ async fn route(env: Arc<Env>, req: Request<IncomingBody>) -> Result<Response<Box
                 )
                 .body(create_body(response_body, response_encoding))
         }
-        (&Method::POST, _, Some("application/json")) => Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(create_body("Access Denied", Encoding::Identity)),
+        (&Method::POST, _, Some("application/json")) => {
+            http_response_builder(StatusCode::FORBIDDEN)
+                .body(create_body("Access Denied", Encoding::Identity))
+        }
 
-        (&Method::POST, _, _) => Response::builder()
-            .status(StatusCode::BAD_REQUEST)
+        (&Method::POST, _, _) => http_response_builder(StatusCode::BAD_REQUEST)
             .body(create_body("Bad Request", Encoding::Identity)),
 
-        (method, _, _) => Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(create_body(
-                format!("Method {method} not allowed."),
-                Encoding::Identity,
-            )),
+        (method, _, _) => http_response_builder(StatusCode::METHOD_NOT_ALLOWED).body(create_body(
+            format!("Method {method} not allowed."),
+            Encoding::Identity,
+        )),
     }
     .map_err(|err| err.into())
 }

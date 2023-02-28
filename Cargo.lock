@@ -1348,6 +1348,7 @@ dependencies = [
  "flate2",
  "fly-accept-encoding",
  "futures",
+ "http",
  "http-body-util",
  "hyper 1.0.0-rc.3",
  "log",
