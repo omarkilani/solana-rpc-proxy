@@ -162,6 +162,8 @@ async fn main() -> Result<()> {
 
     info!("DB Pool: {:?}", &db_pool);
 
+    sqlx::migrate!().run(&db_pool).await?;
+
     let http_client = Client::new();
 
     info!("HTTP Client: {:?}", &http_client);
