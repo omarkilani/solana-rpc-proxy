@@ -1,0 +1,23 @@
+version: "3.9"
+name: solana-rpc-proxy
+services:
+  jsonrpc:
+    build: .
+    environment:
+      - DATABASE_URL=postgres://postgres:123456@db/postgres
+      - RPC_TOKEN=SomethingVeryLongThatNoOneCanEverGuess
+      - RUST_LOG=debug
+      - SOLANA_RPC_ENDPOINTS=https://api.mainnet-beta.solana.com,http://103.50.32.114:8899
+    ports:
+      - "8899:8899"
+    restart: always
+  db:
+    environment:
+      - POSTGRES_PASSWORD=123456
+    image: postgres
+    restart: always
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
