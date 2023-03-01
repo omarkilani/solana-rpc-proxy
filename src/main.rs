@@ -144,9 +144,14 @@ async fn main() -> Result<()> {
 
     pretty_env_logger::init();
 
-    let config = envy::from_env::<Config>().expect(
-        "Please provide DATABASE_URL, LISTEN_ADDRESS, RPC_TOKEN, and SOLANA_RPC_ENDPOINTS env vars",
-    );
+    let config = envy::from_env::<Config>().map_err(|err| match err {
+        envy::Error::MissingValue(name) => format!("Missing env var: {}", name.to_uppercase()),
+        envy::Error::Custom(message) => format!("Cannot read env vars: {message}."),
+    })?;
+
+    if config.solana_rpc_endpoints.is_empty() {
+        Err("SOLANA_RPC_ENDPOINTS cannot be empty.")?
+    }
 
     info!("Config: {:?}", &config);
 
