@@ -544,8 +544,14 @@ fn get_cache_key(call: &RpcCall) -> Option<CacheKey> {
                 .and_then(|value| value[1]["maxSupportedTransactionVersion"].as_i64())
                 .unwrap_or(-1);
 
+            let encoding = call
+                .params
+                .as_ref()
+                .and_then(|value| value[1]["encoding"].as_str())
+                .unwrap_or("json");
+
             Some(CacheKey(format!(
-                "getTransaction::{txn_id}::{max_supported_txn_version}"
+                "getTransaction::{txn_id}::{max_supported_txn_version}::{encoding}"
             )))
         }
         _ => None,
