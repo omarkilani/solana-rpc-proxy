@@ -9,6 +9,8 @@ use fly_accept_encoding::Encoding;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::TryFutureExt;
+use governor::{Quota, RateLimiter, DefaultDirectRateLimiter};
+use nonzero_ext::*;
 use http::response;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -27,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
@@ -48,6 +50,7 @@ struct Env {
     config: Config,
     db_pool: PgPool,
     http_client: Client,
+    limiter: DefaultDirectRateLimiter,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -156,22 +159,27 @@ async fn main() -> Result<()> {
     info!("Config: {:?}", &config);
 
     let db_pool: PgPool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(32)
         .connect(&config.database_url)
         .await?;
 
     info!("DB Pool: {:?}", &db_pool);
 
-    sqlx::migrate!().run(&db_pool).await?;
+    // sqlx::migrate!().run(&db_pool).await?;
 
     let http_client = Client::new();
 
     info!("HTTP Client: {:?}", &http_client);
 
+    let limiter = RateLimiter::direct(Quota::per_second(nonzero!(300u32)));
+
+    info!("Upstream Rate Limiter: {:?}", &limiter);
+
     let env = Arc::new(Env {
         config,
         db_pool,
         http_client,
+        limiter,
     });
 
     let listener = TcpListener::bind(&env.config.listen_address).await?;
@@ -498,6 +506,12 @@ async fn get_from_upstream(
     calls: &[&RpcCall],
 ) -> Result<HashMap<Option<Id>, RpcResult>> {
     if let Some(rpc_request) = RpcRequest::new(calls.to_vec()) {
+        let start = Instant::now();
+        env.limiter.until_ready().await;
+        let duration = start.elapsed();
+
+        debug!("Limiter became ready in {:?}", duration);
+
         let payload: Value = serde_json::to_value(rpc_request)?;
 
         debug!("HTTP request body: {payload}");
@@ -594,15 +608,17 @@ async fn handle_jsonrpc(
                 .and_then(|cache_key| cached_results.get(&cache_key))
                 .or(upstream_results.get(&call.id))
                 .cloned()
-                .unwrap_or(RpcResult::error(call.id.clone(), -32603, "Internal error"))
+                .unwrap_or(RpcResult::error(call.id.clone(), -32601, "Internal error"))
         })
         .collect();
 
     info!(
-        "JSON-RPC Response batch size: {} (from_cache={}, from_upstream={})",
+        "JSON-RPC {:?} Response batch size: {} (from_cache={}, from_upstream={}, upstream={:?})",
+        rpc_request,
         results.len(),
         cached_results.len(),
-        upstream_results.len()
+        upstream_results.len(),
+        upstream_results
     );
 
     Ok(match (rpc_request, results.as_slice()) {
@@ -610,6 +626,6 @@ async fn handle_jsonrpc(
         (RpcRequest::Batch(calls), results) if calls.len() == results.len() => {
             RpcResponse::Batch(results.to_vec())
         }
-        _ => RpcResponse::Single(RpcResult::error(None, -32603, "Internal error")),
+        _ => RpcResponse::Single(RpcResult::error(None, -32602, "Internal error")),
     })
 }
