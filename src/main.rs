@@ -9,8 +9,7 @@ use fly_accept_encoding::Encoding;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::TryFutureExt;
-use governor::{Quota, RateLimiter, DefaultDirectRateLimiter};
-use nonzero_ext::*;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use http::response;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -19,6 +18,7 @@ use hyper::{
     body::Incoming as IncomingBody, header, HeaderMap, Method, Request, Response, StatusCode,
 };
 use log::{debug, error, info};
+use nonzero_ext::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -473,7 +473,7 @@ async fn http_post_json(
     url: &str,
     payload: &Value,
     headers: &HeaderMap,
-) -> Result<Value> {
+) -> Result<RpcResponse> {
     let body = serde_json::to_string(payload)?;
 
     let excluded_headers = ["host", "content-length", "accept-encoding"];
@@ -497,7 +497,19 @@ async fn http_post_json(
 
     debug!("HTTP response body: {text}");
 
-    serde_json::from_str(&text).map_err(|e| e.into())
+    let rpc_response: RpcResponse = serde_json::from_str(&text)?;
+
+    if let Some(error) = rpc_response
+        .results()
+        .iter()
+        .filter_map(|rpc_result| rpc_result.error.as_ref())
+        .next()
+    {
+        debug!("HTTP response jsonrpc error: {:?}", error);
+        Err("jsonrpc error".into())
+    } else {
+        Ok(rpc_response)
+    }
 }
 
 async fn get_from_upstream(
@@ -516,7 +528,7 @@ async fn get_from_upstream(
 
         debug!("HTTP request body: {payload}");
 
-        let task: BoxFuture<Result<Value>> = env
+        let task: BoxFuture<Result<RpcResponse>> = env
             .config
             .solana_rpc_endpoints
             .iter()
@@ -525,9 +537,7 @@ async fn get_from_upstream(
                 Box::pin(acc.or_else(|_| http_post))
             });
 
-        let json = task.await?;
-
-        let rpc_response: RpcResponse = serde_json::from_value(json)?;
+        let rpc_response = task.await?;
 
         Ok(rpc_response
             .results()
